@@ -1,8 +1,8 @@
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
-const mysql = require('mysql2/promise');
 const cors = require('cors');
+const fetch = require('node-fetch');
 
 const app = express();
 const server = http.createServer(app);
@@ -18,158 +18,258 @@ const io = socketIo(server, {
 app.use(cors());
 app.use(express.json());
 
-// ⚠️ CONFIGURACIÓN DE MYSQL - Usa la IP de HostGator
-const dbConfig = {
-    host: '74.220.50.246',  // ← IP de HostGator (cámbiala si es diferente)
-    user: 'wwtene_dev',
-    password: ',.-3A601b14a0-.,',
-    database: 'wwtene_tenet',
-    waitForConnections: true,
-    connectionLimit: 10
-};
+// ============================================
+// CONFIGURACIÓN - USA TU API PHP EN HOSTGATOR
+// ============================================
+const API_URL = 'https://swtenet.com/live/api_ultimas_ubicaciones.php';
 
-let pool;
-let lastCheckTime = null;
-let checkInterval = null;
+// Variable para almacenar la última respuesta (evita emitir datos duplicados)
+let lastEmittedData = null;
 
-async function initDB() {
-    try {
-        pool = mysql.createPool(dbConfig);
-        console.log('✅ Conectado a MySQL');
-        const conn = await pool.getConnection();
-        try {
-            const [rows] = await conn.query(`SELECT MAX(updated_at) as last_update FROM ubicacion`);
-            lastCheckTime = rows[0].last_update || new Date();
-            console.log(`📅 Última actualización: ${lastCheckTime}`);
-        } finally {
-            conn.release();
-        }
-    } catch (error) {
-        console.error('❌ Error conectando a MySQL:', error);
-        setTimeout(initDB, 5000);
-    }
-}
-
+// ============================================
+// FUNCIÓN: Obtener ubicaciones desde tu API PHP
+// ============================================
 async function getCurrentLocations() {
-    const conn = await pool.getConnection();
     try {
-        const [rows] = await conn.query(`
-            SELECT 
-                u.empleado_identificador as id,
-                COALESCE(e.nombre, u.empleado_identificador) as nombre,
-                u.latitude as lat,
-                u.longitude as lng,
-                u.updated_at as ultima_actualizacion,
-                TIMESTAMPDIFF(MINUTE, u.updated_at, NOW()) as minutos_inactivo
-            FROM ubicacion u
-            LEFT JOIN empleados e ON u.empleado_identificador = e.identificador
-            INNER JOIN (
-                SELECT empleado_identificador, MAX(updated_at) as max_updated
-                FROM ubicacion
-                GROUP BY empleado_identificador
-            ) latest ON u.empleado_identificador = latest.empleado_identificador 
-                    AND u.updated_at = latest.max_updated
-            ORDER BY u.updated_at DESC
-        `);
-
-        return rows.map(row => {
-            let estado, color, pulso;
-            if (row.minutos_inactivo <= 5) {
-                estado = 'activo';
-                color = '#10B981';
-                pulso = true;
-            } else if (row.minutos_inactivo <= 30) {
-                estado = 'pendiente';
-                color = '#F59E0B';
-                pulso = false;
-            } else {
-                estado = 'inactivo';
-                color = '#6B7280';
-                pulso = false;
-            }
-
-            return {
-                ...row,
-                lat: parseFloat(row.lat),
-                lng: parseFloat(row.lng),
-                minutos_inactivo: parseInt(row.minutos_inactivo),
-                estado,
-                color,
-                pulso,
-                ultima_actualizacion: row.ultima_actualizacion
-            };
-        });
-    } finally {
-        conn.release();
-    }
-}
-
-async function checkForUpdates() {
-    try {
-        if (!pool) return;
-        const conn = await pool.getConnection();
-        try {
-            const [newLocations] = await conn.query(
-                `SELECT 1 FROM ubicacion WHERE updated_at > ? LIMIT 1`,
-                [lastCheckTime]
-            );
-
-            if (newLocations.length > 0) {
-                console.log('📡 Detectadas nuevas ubicaciones');
-                lastCheckTime = new Date();
-                const allLocations = await getCurrentLocations();
-                if (allLocations.length > 0) {
-                    io.emit('locations_update', allLocations);
-                    console.log(`📤 Emitidas ${allLocations.length} ubicaciones`);
-                }
-            }
-        } finally {
-            conn.release();
+        const response = await fetch(API_URL);
+        
+        if (!response.ok) {
+            console.error(`❌ API respondió con status: ${response.status}`);
+            return [];
+        }
+        
+        const data = await response.json();
+        
+        if (data.success && data.empleados) {
+            console.log(`📡 API devolvió ${data.empleados.length} empleados`);
+            return data.empleados;
+        } else {
+            console.warn('⚠️ API no devolvió empleados:', data);
+            return [];
         }
     } catch (error) {
-        console.error('❌ Error:', error);
+        console.error('❌ Error consultando API:', error.message);
+        return [];
     }
 }
 
+// ============================================
+// FUNCIÓN: Verificar cambios y emitir si hay nuevos datos
+// ============================================
+async function checkAndEmitUpdates() {
+    try {
+        const locations = await getCurrentLocations();
+        
+        if (locations.length === 0) {
+            return;
+        }
+        
+        // Convertir a string para comparar si hubo cambios
+        const currentDataStr = JSON.stringify(locations);
+        const lastDataStr = lastEmittedData ? JSON.stringify(lastEmittedData) : null;
+        
+        // Solo emitir si los datos cambiaron
+        if (currentDataStr !== lastDataStr) {
+            lastEmittedData = locations;
+            io.emit('locations_update', locations);
+            console.log(`📤 Emitidas ${locations.length} ubicaciones a ${io.engine.clientsCount} clientes`);
+        }
+    } catch (error) {
+        console.error('❌ Error en checkAndEmitUpdates:', error.message);
+    }
+}
+
+// ============================================
+// ENDPOINTS REST
+// ============================================
+
+// Endpoint para obtener ubicaciones (carga inicial)
 app.get('/api/ubicaciones', async (req, res) => {
     try {
         const locations = await getCurrentLocations();
-        res.json({ success: true, empleados: locations, total: locations.length });
+        res.json({
+            success: true,
+            empleados: locations,
+            total: locations.length,
+            timestamp: new Date().toISOString()
+        });
     } catch (error) {
-        res.status(500).json({ success: false, error: 'Error al obtener ubicaciones' });
+        console.error('❌ Error en /api/ubicaciones:', error.message);
+        res.status(500).json({
+            success: false,
+            error: 'Error al obtener ubicaciones'
+        });
     }
 });
 
+// Endpoint de salud para verificar estado
 app.get('/api/health', (req, res) => {
     res.json({
         status: 'ok',
+        timestamp: new Date().toISOString(),
         clients_connected: io.engine.clientsCount || 0,
-        last_check: lastCheckTime
+        api_url: API_URL,
+        last_emitted: lastEmittedData ? `${lastEmittedData.length} empleados` : 'ninguno'
     });
 });
 
+// Endpoint para recibir ubicaciones desde Android (opcional, si quieres mantenerlo)
+app.post('/api/ubicacion', async (req, res) => {
+    try {
+        const { identificador, latitude, longitude } = req.body;
+        
+        if (!identificador || !latitude || !longitude) {
+            return res.status(400).json({
+                success: false,
+                error: 'Faltan parámetros: identificador, latitude, longitude'
+            });
+        }
+        
+        // Aquí podrías guardar en tu base de datos si lo deseas
+        // O simplemente responder que se recibió
+        console.log(`📱 Ubicación recibida de ${identificador}: ${latitude}, ${longitude}`);
+        
+        // Opcional: Podrías forzar una actualización inmediata
+        // setTimeout(checkAndEmitUpdates, 500);
+        
+        res.json({
+            success: true,
+            message: 'Ubicación recibida correctamente'
+        });
+    } catch (error) {
+        console.error('❌ Error en /api/ubicacion:', error.message);
+        res.status(500).json({
+            success: false,
+            error: 'Error al procesar ubicación'
+        });
+    }
+});
+
+// ============================================
+// SOCKET.IO - CONEXIONES DE CLIENTES
+// ============================================
+
 io.on('connection', (socket) => {
-    console.log(`👤 Cliente conectado: ${socket.id}`);
+    console.log(`👤 Cliente conectado: ${socket.id} (Total: ${io.engine.clientsCount})`);
+    
+    // Enviar datos iniciales al cliente recién conectado
     (async () => {
         try {
             const locations = await getCurrentLocations();
             socket.emit('initial_locations', locations);
+            console.log(`📤 Enviados ${locations.length} empleados a ${socket.id}`);
+            
+            // Guardar como último emitido para referencia
+            if (locations.length > 0) {
+                lastEmittedData = locations;
+            }
         } catch (error) {
-            socket.emit('error', { message: 'Error al cargar datos iniciales' });
+            console.error('❌ Error enviando datos iniciales:', error.message);
+            socket.emit('error', { 
+                message: 'Error al cargar datos iniciales',
+                details: error.message
+            });
         }
     })();
+
+    // Escuchar eventos personalizados del cliente
+    socket.on('request_update', async () => {
+        try {
+            const locations = await getCurrentLocations();
+            socket.emit('locations_update', locations);
+            console.log(`📤 Actualización solicitada enviada a ${socket.id}`);
+        } catch (error) {
+            console.error('❌ Error en request_update:', error.message);
+        }
+    });
+
+    socket.on('disconnect', () => {
+        console.log(`👤 Cliente desconectado: ${socket.id} (Total: ${io.engine.clientsCount})`);
+    });
 });
 
-async function startServer() {
-    await initDB();
-    if (pool) {
-        checkInterval = setInterval(checkForUpdates, 3000);
-        console.log('🔄 Monitoreo iniciado (intervalo: 3s)');
+// ============================================
+// MONITOREO PERIÓDICO (cada 3 segundos)
+// ============================================
+
+let updateInterval = null;
+
+function startMonitoring() {
+    if (updateInterval) {
+        clearInterval(updateInterval);
     }
+    
+    // Verificar cambios cada 3 segundos
+    updateInterval = setInterval(checkAndEmitUpdates, 3000);
+    console.log('🔄 Monitoreo iniciado (intervalo: 3s)');
+}
+
+function stopMonitoring() {
+    if (updateInterval) {
+        clearInterval(updateInterval);
+        updateInterval = null;
+        console.log('⏹️ Monitoreo detenido');
+    }
+}
+
+// ============================================
+// INICIAR SERVIDOR
+// ============================================
+
+async function startServer() {
+    // Probar conexión a la API al iniciar
+    console.log('🔍 Probando conexión a la API...');
+    const testLocations = await getCurrentLocations();
+    if (testLocations.length > 0) {
+        console.log(`✅ API funcionando: ${testLocations.length} empleados encontrados`);
+        lastEmittedData = testLocations;
+    } else {
+        console.warn('⚠️ No se encontraron empleados en la API. Verifica que api_ultimas_ubicaciones.php esté funcionando.');
+    }
+    
+    // Iniciar monitoreo periódico
+    startMonitoring();
+    
+    // Iniciar servidor
     const PORT = process.env.PORT || 3000;
-    server.listen(PORT, () => {
-        console.log(`🚀 Servidor en puerto ${PORT}`);
+    server.listen(PORT, '0.0.0.0', () => {
+        console.log(`========================================`);
+        console.log(`🚀 Servidor WebSocket corriendo`);
+        console.log(`📡 URL: https://gps-ws.onrender.com`);
+        console.log(`📡 API: ${API_URL}`);
+        console.log(`📡 Health Check: /api/health`);
+        console.log(`📡 Puerto: ${PORT}`);
+        console.log(`========================================`);
     });
 }
 
-startServer().catch(console.error);
+// ============================================
+// MANEJO DE CIERRE GRACEFUL
+// ============================================
+
+process.on('SIGINT', () => {
+    console.log('\n🛑 Recibida señal SIGINT. Cerrando servidor...');
+    stopMonitoring();
+    server.close(() => {
+        console.log('👋 Servidor cerrado');
+        process.exit(0);
+    });
+});
+
+process.on('SIGTERM', () => {
+    console.log('\n🛑 Recibida señal SIGTERM. Cerrando servidor...');
+    stopMonitoring();
+    server.close(() => {
+        console.log('👋 Servidor cerrado');
+        process.exit(0);
+    });
+});
+
+// ============================================
+// EJECUTAR
+// ============================================
+
+startServer().catch(error => {
+    console.error('❌ Error fatal iniciando servidor:', error);
+    process.exit(1);
+});
