@@ -18,13 +18,11 @@ const io = socketIo(server, {
 app.use(cors());
 app.use(express.json());
 
-// ============================================
-// CONFIGURACIÓN - USA TU API PHP EN HOSTGATOR
-// ============================================
 const API_URL = 'https://swtenet.com/live/api_ultimas_ubicaciones.php';
 
-// Variable para almacenar la última respuesta (evita emitir datos duplicados)
 let lastEmittedData = null;
+let updateInterval = null;
+let activeClients = 0;
 
 // ============================================
 // FUNCIÓN: Obtener ubicaciones desde tu API PHP
@@ -44,7 +42,6 @@ async function getCurrentLocations() {
             console.log(`📡 API devolvió ${data.empleados.length} empleados`);
             return data.empleados;
         } else {
-            console.warn('⚠️ API no devolvió empleados:', data);
             return [];
         }
     } catch (error) {
@@ -54,9 +51,14 @@ async function getCurrentLocations() {
 }
 
 // ============================================
-// FUNCIÓN: Verificar cambios y emitir si hay nuevos datos
+// FUNCIÓN: Verificar cambios y emitir
 // ============================================
 async function checkAndEmitUpdates() {
+    // Si no hay clientes, no hacer nada
+    if (activeClients === 0) {
+        return;
+    }
+    
     try {
         const locations = await getCurrentLocations();
         
@@ -64,18 +66,37 @@ async function checkAndEmitUpdates() {
             return;
         }
         
-        // Convertir a string para comparar si hubo cambios
         const currentDataStr = JSON.stringify(locations);
         const lastDataStr = lastEmittedData ? JSON.stringify(lastEmittedData) : null;
         
-        // Solo emitir si los datos cambiaron
         if (currentDataStr !== lastDataStr) {
             lastEmittedData = locations;
             io.emit('locations_update', locations);
-            console.log(`📤 Emitidas ${locations.length} ubicaciones a ${io.engine.clientsCount} clientes`);
+            console.log(`📤 Emitidas ${locations.length} ubicaciones a ${activeClients} clientes`);
         }
     } catch (error) {
         console.error('❌ Error en checkAndEmitUpdates:', error.message);
+    }
+}
+
+// ============================================
+// INICIAR / DETENER MONITOREO
+// ============================================
+function startMonitoring() {
+    if (updateInterval) {
+        clearInterval(updateInterval);
+    }
+    
+    // Verificar cambios cada 3 segundos
+    updateInterval = setInterval(checkAndEmitUpdates, 3000);
+    console.log('🔄 Monitoreo iniciado (intervalo: 3s)');
+}
+
+function stopMonitoring() {
+    if (updateInterval) {
+        clearInterval(updateInterval);
+        updateInterval = null;
+        console.log('⏹️ Monitoreo detenido (sin clientes)');
     }
 }
 
@@ -94,7 +115,6 @@ app.get('/api/ubicaciones', async (req, res) => {
             timestamp: new Date().toISOString()
         });
     } catch (error) {
-        console.error('❌ Error en /api/ubicaciones:', error.message);
         res.status(500).json({
             success: false,
             error: 'Error al obtener ubicaciones'
@@ -102,47 +122,16 @@ app.get('/api/ubicaciones', async (req, res) => {
     }
 });
 
-// Endpoint de salud para verificar estado
+// Endpoint de salud
 app.get('/api/health', (req, res) => {
     res.json({
         status: 'ok',
         timestamp: new Date().toISOString(),
-        clients_connected: io.engine.clientsCount || 0,
+        clients_connected: activeClients,
         api_url: API_URL,
+        monitoring: updateInterval ? 'activo' : 'detenido',
         last_emitted: lastEmittedData ? `${lastEmittedData.length} empleados` : 'ninguno'
     });
-});
-
-// Endpoint para recibir ubicaciones desde Android (opcional, si quieres mantenerlo)
-app.post('/api/ubicacion', async (req, res) => {
-    try {
-        const { identificador, latitude, longitude } = req.body;
-        
-        if (!identificador || !latitude || !longitude) {
-            return res.status(400).json({
-                success: false,
-                error: 'Faltan parámetros: identificador, latitude, longitude'
-            });
-        }
-        
-        // Aquí podrías guardar en tu base de datos si lo deseas
-        // O simplemente responder que se recibió
-        console.log(`📱 Ubicación recibida de ${identificador}: ${latitude}, ${longitude}`);
-        
-        // Opcional: Podrías forzar una actualización inmediata
-        // setTimeout(checkAndEmitUpdates, 500);
-        
-        res.json({
-            success: true,
-            message: 'Ubicación recibida correctamente'
-        });
-    } catch (error) {
-        console.error('❌ Error en /api/ubicacion:', error.message);
-        res.status(500).json({
-            success: false,
-            error: 'Error al procesar ubicación'
-        });
-    }
 });
 
 // ============================================
@@ -150,16 +139,21 @@ app.post('/api/ubicacion', async (req, res) => {
 // ============================================
 
 io.on('connection', (socket) => {
-    console.log(`👤 Cliente conectado: ${socket.id} (Total: ${io.engine.clientsCount})`);
+    activeClients++;
+    console.log(`👤 Cliente conectado: ${socket.id} (Total: ${activeClients})`);
     
-    // Enviar datos iniciales al cliente recién conectado
+    // Si es el primer cliente, iniciar monitoreo
+    if (activeClients === 1) {
+        startMonitoring();
+    }
+    
+    // Enviar datos iniciales
     (async () => {
         try {
             const locations = await getCurrentLocations();
             socket.emit('initial_locations', locations);
             console.log(`📤 Enviados ${locations.length} empleados a ${socket.id}`);
             
-            // Guardar como último emitido para referencia
             if (locations.length > 0) {
                 lastEmittedData = locations;
             }
@@ -172,75 +166,39 @@ io.on('connection', (socket) => {
         }
     })();
 
-    // Escuchar eventos personalizados del cliente
-    socket.on('request_update', async () => {
-        try {
-            const locations = await getCurrentLocations();
-            socket.emit('locations_update', locations);
-            console.log(`📤 Actualización solicitada enviada a ${socket.id}`);
-        } catch (error) {
-            console.error('❌ Error en request_update:', error.message);
+    socket.on('disconnect', () => {
+        activeClients--;
+        console.log(`👤 Cliente desconectado: ${socket.id} (Total: ${activeClients})`);
+        
+        // Si no quedan clientes, detener monitoreo
+        if (activeClients === 0) {
+            stopMonitoring();
         }
     });
-
-    socket.on('disconnect', () => {
-        console.log(`👤 Cliente desconectado: ${socket.id} (Total: ${io.engine.clientsCount})`);
-    });
 });
-
-// ============================================
-// MONITOREO PERIÓDICO (cada 3 segundos)
-// ============================================
-
-let updateInterval = null;
-
-function startMonitoring() {
-    if (updateInterval) {
-        clearInterval(updateInterval);
-    }
-    
-    // Verificar cambios cada 3 segundos
-    updateInterval = setInterval(checkAndEmitUpdates, 3000);
-    console.log('🔄 Monitoreo iniciado (intervalo: 3s)');
-}
-
-function stopMonitoring() {
-    if (updateInterval) {
-        clearInterval(updateInterval);
-        updateInterval = null;
-        console.log('⏹️ Monitoreo detenido');
-    }
-}
 
 // ============================================
 // INICIAR SERVIDOR
 // ============================================
 
 async function startServer() {
-    // Probar conexión a la API al iniciar
-    console.log('🔍 Probando conexión a la API...');
-    const testLocations = await getCurrentLocations();
-    if (testLocations.length > 0) {
-        console.log(`✅ API funcionando: ${testLocations.length} empleados encontrados`);
-        lastEmittedData = testLocations;
-    } else {
-        console.warn('⚠️ No se encontraron empleados en la API. Verifica que api_ultimas_ubicaciones.php esté funcionando.');
-    }
-    
-    // Iniciar monitoreo periódico
-    startMonitoring();
-    
-    // Iniciar servidor
     const PORT = process.env.PORT || 3000;
     server.listen(PORT, '0.0.0.0', () => {
         console.log(`========================================`);
         console.log(`🚀 Servidor WebSocket corriendo`);
         console.log(`📡 URL: https://gps-ws.onrender.com`);
         console.log(`📡 API: ${API_URL}`);
-        console.log(`📡 Health Check: /api/health`);
         console.log(`📡 Puerto: ${PORT}`);
+        console.log(`📡 Estado: Esperando clientes...`);
         console.log(`========================================`);
     });
+    
+    // Cargar datos iniciales para tenerlos listos
+    const testLocations = await getCurrentLocations();
+    if (testLocations.length > 0) {
+        console.log(`✅ Datos precargados: ${testLocations.length} empleados`);
+        lastEmittedData = testLocations;
+    }
 }
 
 // ============================================
@@ -248,28 +206,15 @@ async function startServer() {
 // ============================================
 
 process.on('SIGINT', () => {
-    console.log('\n🛑 Recibida señal SIGINT. Cerrando servidor...');
+    console.log('\n🛑 Cerrando servidor...');
     stopMonitoring();
     server.close(() => {
         console.log('👋 Servidor cerrado');
         process.exit(0);
     });
 });
-
-process.on('SIGTERM', () => {
-    console.log('\n🛑 Recibida señal SIGTERM. Cerrando servidor...');
-    stopMonitoring();
-    server.close(() => {
-        console.log('👋 Servidor cerrado');
-        process.exit(0);
-    });
-});
-
-// ============================================
-// EJECUTAR
-// ============================================
 
 startServer().catch(error => {
-    console.error('❌ Error fatal iniciando servidor:', error);
+    console.error('❌ Error fatal:', error);
     process.exit(1);
 });
